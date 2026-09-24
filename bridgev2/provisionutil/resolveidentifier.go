@@ -110,12 +110,30 @@ func ResolveIdentifier(
 			}
 		}
 		resp.Chat.Portal.CleanupOrphanedDM(ctx, login.UserMXID)
-		if createChat && resp.Chat.Portal.MXID == "" {
-			apiResp.JustCreated = true
+		_, gated := login.Client.(bridgev2.PortalBootstrapSource)
+		if createChat && (resp.Chat.Portal.MXID == "" || gated) {
+			apiResp.JustCreated = resp.Chat.Portal.MXID == ""
 			err := resp.Chat.Portal.CreateMatrixRoom(ctx, login, resp.Chat.PortalInfo)
 			if err != nil {
-				zerolog.Ctx(ctx).Err(err).Msg("Failed to create portal room")
-				return nil, bridgev2.RespError(mautrix.MUnknown.WithMessage("Failed to create portal room"))
+				zerolog.Ctx(ctx).Err(err).Msg("Failed to finish portal room import")
+				if errors.Is(err, bridgev2.ErrBootstrapPending) {
+					return nil, bridgev2.RespError(mautrix.MUnknown.WithMessage("Chat history import pending; room not ready"))
+				}
+				if errors.Is(err, bridgev2.ErrBootstrapNeedsReconciliation) {
+					return nil, bridgev2.RespError(mautrix.MUnknown.WithMessage("Portal needs review before import can continue"))
+				}
+				if gated {
+					job, statusErr := login.Bridge.DB.GetBootstrapJob(ctx, login.ID, resp.Chat.Portal.PortalKey)
+					if statusErr == nil && job != nil {
+						switch job.Status {
+						case "incomplete":
+							return nil, bridgev2.RespError(mautrix.MUnknown.WithMessage("Chat history import incomplete; room not ready"))
+						case "importing":
+							return nil, bridgev2.RespError(mautrix.MUnknown.WithMessage("Chat history import running; room not ready"))
+						}
+					}
+				}
+				return nil, bridgev2.RespError(mautrix.MUnknown.WithMessage("Failed to finish portal room import"))
 			}
 		}
 		apiResp.Portal = resp.Chat.Portal

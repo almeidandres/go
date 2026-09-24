@@ -345,6 +345,9 @@ func (bsq *BridgeStateQueue) Send(state status.BridgeState) {
 	default:
 		bsq.login.Log.Error().Msg("Bridge state queue is full, dropped new state")
 	}
+	if state.StateEvent == status.StateConnected {
+		bsq.login.ResumeBootstrapJobs()
+	}
 }
 
 func (bsq *BridgeStateQueue) GetPrev() status.BridgeState {

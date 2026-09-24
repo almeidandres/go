@@ -402,7 +402,7 @@ func (portal *PortalInternals) FetchThreadInsideBatch(ctx context.Context, sourc
 }
 
 func (portal *PortalInternals) SendBatch(ctx context.Context, source *UserLogin, messages []*BackfillMessage, forceForward, markRead, inThread bool) error {
-	return (*Portal)(portal).sendBatch(ctx, source, messages, forceForward, markRead, inThread)
+	return (*Portal)(portal).sendBatch(ctx, source, messages, forceForward, markRead, inThread, true)
 }
 
 func (portal *PortalInternals) SendLegacyBackfill(ctx context.Context, source *UserLogin, messages []*BackfillMessage, markRead bool) error {

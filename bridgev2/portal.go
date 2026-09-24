@@ -2905,6 +2905,22 @@ func (portal *Portal) sendConvertedMessage(
 			Metadata:         part.DBMetadata,
 			IsDoublePuppeted: intent.IsDoublePuppet(),
 		}
+		if ctx.Value(bootstrapTransactionKey{}) != nil {
+			saved, err := portal.Bridge.DB.Message.GetPartByID(ctx, portal.Receiver, id, part.ID)
+			if err != nil {
+				return output, EventHandlingResultFailed.WithError(err)
+			}
+			if saved != nil {
+				if saved.Room != portal.PortalKey || saved.SenderID != senderID {
+					return output, EventHandlingResultFailed.WithError(fmt.Errorf("bootstrap message part %s has a conflicting mapping", part.ID))
+				}
+				output = append(output, saved)
+				if prevThreadEvent != nil && !saved.HasFakeMXID() {
+					prevThreadEvent = saved
+				}
+				continue
+			}
+		}
 		if part.DontBridge {
 			dbMessage.SetFakeMXID()
 			logContext(log.Debug()).
@@ -3079,6 +3095,28 @@ func (portal *Portal) handleRemoteMessage(ctx context.Context, source *UserLogin
 			} else {
 				return res
 			}
+		} else if state, isBootstrap := ctx.Value(bootstrapTransactionKey{}).(*bootstrapTransactionState); isBootstrap {
+			_, checkpointed, checkpointErr := portal.Bridge.DB.GetBootstrapExpectedParts(ctx, source.ID, portal.PortalKey, state.stableID)
+			if checkpointErr != nil {
+				return EventHandlingResultFailed.WithError(checkpointErr)
+			}
+			if !checkpointed {
+				log.Debug().Stringer("existing_mxid", existing[0].MXID).Msg("Incoming message was already imported as history")
+				return EventHandlingResultIgnored
+			}
+			intent, ok := portal.GetIntentFor(ctx, evt.GetSender(), source, RemoteEventMessage)
+			if !ok {
+				return EventHandlingResultFailed.WithError(ErrFailedToGetIntent)
+			}
+			converted, err := evt.ConvertMessage(ctx, portal, intent)
+			if err != nil {
+				return EventHandlingResultFailed.WithError(err)
+			}
+			if err := portal.checkpointBootstrapMessage(ctx, source, converted); err != nil {
+				return EventHandlingResultFailed.WithError(err)
+			}
+			_, res = portal.sendConvertedMessage(ctx, source, evt.GetID(), intent, evt.GetSender().Sender, converted, getEventTS(evt), getStreamOrder(evt), nil)
+			return res
 		} else {
 			log.Debug().Stringer("existing_mxid", existing[0].MXID).Msg("Ignoring duplicate message")
 			return EventHandlingResultIgnored
@@ -3099,6 +3137,9 @@ func (portal *Portal) handleRemoteMessage(ctx context.Context, source *UserLogin
 			portal.sendRemoteErrorNotice(ctx, intent, err, ts, "message")
 			return EventHandlingResultFailed.WithError(err)
 		}
+	}
+	if err := portal.checkpointBootstrapMessage(ctx, source, converted); err != nil {
+		return EventHandlingResultFailed.WithError(err)
 	}
 	_, res = portal.sendConvertedMessage(ctx, source, evt.GetID(), intent, evt.GetSender().Sender, converted, ts, getStreamOrder(evt), nil)
 	if portal.currentlyTypingGhosts.Pop(intent.GetMXID()) {
@@ -5034,7 +5075,7 @@ func (portal *Portal) updateParent(ctx context.Context, newParentID networkid.Po
 	if portal.MXID != "" && portal.Parent != nil && (source != nil || portal.Parent.MXID != "") {
 		if portal.Parent.MXID == "" {
 			zerolog.Ctx(ctx).Info().Msg("Parent portal doesn't exist, creating")
-			err = portal.Parent.CreateMatrixRoom(ctx, source, nil)
+			err = portal.Parent.createMatrixRoom(ctx, source, nil, false)
 			if err != nil {
 				zerolog.Ctx(ctx).Err(err).Msg("Failed to create parent portal")
 			}
@@ -5188,12 +5229,39 @@ func (portal *Portal) updateChildBridgeInfo(ctx context.Context) {
 	}
 }
 
-func (portal *Portal) CreateMatrixRoom(ctx context.Context, source *UserLogin, info *ChatInfo) (retErr error) {
+func (portal *Portal) CreateMatrixRoom(ctx context.Context, source *UserLogin, info *ChatInfo) error {
+	return portal.createMatrixRoom(ctx, source, info, true)
+}
+
+func (portal *Portal) createMatrixRoom(ctx context.Context, source *UserLogin, info *ChatInfo, selectChat bool) (retErr error) {
 	if portal.MXID != "" {
-		if source != nil {
-			source.MarkInPortal(ctx, portal)
+		if source == nil {
+			return nil
 		}
-		return nil
+		source.MarkInPortal(ctx, portal)
+		if !selectChat {
+			return nil
+		}
+		if _, ok := source.Client.(PortalBootstrapSource); !ok {
+			return nil
+		}
+		job, err := portal.Bridge.DB.GetBootstrapJob(ctx, source.ID, portal.PortalKey)
+		if err != nil {
+			return err
+		}
+		if job == nil || job.Status == "ready" {
+			return nil
+		}
+		if job.Status == "reconcile" {
+			return ErrBootstrapNeedsReconciliation
+		}
+		// Resume an occupied room without creating another Matrix room.
+	} else if selectChat && source != nil && source.Client != nil && portal.RoomType != database.RoomTypeSpace {
+		if _, ok := source.Client.(PortalBootstrapSource); ok {
+			if err := portal.Bridge.DB.EnsureBootstrapJob(ctx, source.ID, portal.PortalKey); err != nil {
+				return fmt.Errorf("select portal for history import: %w", err)
+			}
+		}
 	}
 	if portal.backgroundCtx.Err() != nil {
 		return ErrPortalIsDeleted
@@ -5234,7 +5302,7 @@ func (portal *Portal) CreateMatrixRoom(ctx context.Context, source *UserLogin, i
 	}
 }
 
-func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLogin, info *ChatInfo, backfillBundle any) error {
+func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLogin, info *ChatInfo, backfillBundle any) (retErr error) {
 	cancellableCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	portal.cancelRoomCreate.CompareAndSwap(nil, &cancel)
@@ -5244,6 +5312,15 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 	if portal.MXID != "" {
 		if source != nil {
 			source.MarkInPortal(ctx, portal)
+			if _, ok := source.Client.(PortalBootstrapSource); ok {
+				job, err := portal.Bridge.DB.GetBootstrapJob(ctx, source.ID, portal.PortalKey)
+				if err != nil {
+					return err
+				}
+				if job != nil && job.Status != "ready" {
+					return portal.finishBootstrapInLoop(ctx, source)
+				}
+			}
 		}
 		return nil
 	}
@@ -5272,6 +5349,53 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 	portal.UpdateInfo(cancellableCtx, info, source, nil, time.Time{})
 	if cancellableCtx.Err() != nil {
 		return cancellableCtx.Err()
+	}
+
+	var bootstrap *database.BootstrapJob
+	var finishStarted bool
+	if portal.RoomType != database.RoomTypeSpace {
+		if history, ok := source.Client.(PortalBootstrapSource); ok {
+			bootstrap, err = portal.Bridge.DB.GetBootstrapJob(cancellableCtx, source.ID, portal.PortalKey)
+			if err != nil {
+				return err
+			}
+			if bootstrap == nil {
+				return ErrBootstrapNotSelected
+			}
+			if bootstrap.Status == "reconcile" {
+				return ErrBootstrapNeedsReconciliation
+			}
+			if bootstrap.Status == "importing" {
+				if err := portal.Bridge.DB.SetBootstrapStatus(ctx, source.ID, portal.PortalKey, "reconcile", "room creation outcome unknown after interruption"); err != nil {
+					return err
+				}
+				return ErrBootstrapNeedsReconciliation
+			}
+			defer func() {
+				if !finishStarted && retErr != nil && !errors.Is(retErr, ErrBootstrapPending) && !errors.Is(retErr, ErrBootstrapNeedsReconciliation) {
+					statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+					defer cancel()
+					if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "incomplete", retErr.Error()); statusErr != nil {
+						log.Err(statusErr).Msg("Failed to record incomplete portal import")
+					}
+				}
+			}()
+			if !bootstrap.SourceComplete {
+				if err = history.StageBootstrapHistory(cancellableCtx, portal); err != nil {
+					return fmt.Errorf("stage selected chat history: %w", err)
+				}
+				bootstrap, err = portal.Bridge.DB.GetBootstrapJob(cancellableCtx, source.ID, portal.PortalKey)
+				if err != nil {
+					return err
+				}
+				if bootstrap == nil || !bootstrap.SourceComplete {
+					return ErrBootstrapPending
+				}
+			}
+			if err = portal.Bridge.DB.SetBootstrapStatus(cancellableCtx, source.ID, portal.PortalKey, "importing", ""); err != nil {
+				return fmt.Errorf("start selected chat import: %w", err)
+			}
+		}
 	}
 
 	powerLevels := &event.PowerLevelsEventContent{
@@ -5399,6 +5523,14 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 	roomID, err := portal.Bridge.Bot.CreateRoom(ctx, &req)
 	if err != nil {
 		log.Err(err).Msg("Failed to create Matrix room")
+		if bootstrap != nil {
+			statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "reconcile", "room creation request failed; outcome unknown"); statusErr != nil {
+				return fmt.Errorf("%w: room creation: %v; status checkpoint: %v", ErrBootstrapNeedsReconciliation, err, statusErr)
+			}
+			return fmt.Errorf("%w: %v", ErrBootstrapNeedsReconciliation, err)
+		}
 		return err
 	}
 	log.Info().Stringer("room_id", roomID).Msg("Matrix room created")
@@ -5414,9 +5546,17 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 	err = portal.Save(ctx)
 	if err != nil {
 		log.Err(err).Msg("Failed to save portal to database after creating Matrix room")
+		if bootstrap != nil {
+			statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "reconcile", "Matrix room exists but portal mapping was not saved"); statusErr != nil {
+				return fmt.Errorf("%w: room mapping: %v; status checkpoint: %v", ErrBootstrapNeedsReconciliation, err, statusErr)
+			}
+			return fmt.Errorf("%w: %v", ErrBootstrapNeedsReconciliation, err)
+		}
 		return err
 	}
-	if info.CanBackfill && portal.RoomType != database.RoomTypeSpace {
+	if bootstrap == nil && info.CanBackfill && portal.RoomType != database.RoomTypeSpace {
 		err = portal.Bridge.DB.BackfillTask.Upsert(ctx, &database.BackfillTask{
 			PortalKey:         portal.PortalKey,
 			UserLoginID:       source.ID,
@@ -5453,8 +5593,14 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 			}
 		}
 	}
+	if bootstrap != nil {
+		finishStarted = true
+		if err = portal.finishBootstrapInLoop(ctx, source); err != nil {
+			return err
+		}
+	}
 	portal.addToUserSpaces(ctx)
-	if info.CanBackfill &&
+	if bootstrap == nil && info.CanBackfill &&
 		portal.Bridge.Config.Backfill.Enabled &&
 		portal.RoomType != database.RoomTypeSpace &&
 		!portal.Bridge.Background {

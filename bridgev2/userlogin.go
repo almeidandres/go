@@ -13,6 +13,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -36,9 +37,11 @@ type UserLogin struct {
 
 	inPortalCache *exsync.Set[networkid.PortalKey]
 
-	spaceCreateLock sync.Mutex
-	deleteLock      sync.Mutex
-	disconnectOnce  sync.Once
+	spaceCreateLock        sync.Mutex
+	bootstrapResumeRunning atomic.Bool
+	bootstrapResumeAgain   atomic.Bool
+	deleteLock             sync.Mutex
+	disconnectOnce         sync.Once
 }
 
 func (br *Bridge) loadUserLogin(ctx context.Context, user *User, dbUserLogin *database.UserLogin) (*UserLogin, error) {

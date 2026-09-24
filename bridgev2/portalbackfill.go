@@ -342,7 +342,7 @@ func (portal *Portal) sendBackfill(
 		Msg("Sending backfill messages")
 	var err error
 	if canBatchSend {
-		err = portal.sendBatch(ctx, source, messages, forceForward, markRead || forceMarkRead, inThread)
+		err = portal.sendBatch(ctx, source, messages, forceForward, markRead || forceMarkRead, inThread, true)
 	} else {
 		err = portal.sendLegacyBackfill(ctx, source, messages, markRead || forceMarkRead)
 	}
@@ -523,7 +523,7 @@ func (portal *Portal) fetchThreadInsideBatch(ctx context.Context, source *UserLo
 	}
 }
 
-func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages []*BackfillMessage, forceForward, markRead, inThread bool) error {
+func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages []*BackfillMessage, forceForward, markRead, inThread, sendNotification bool) error {
 	sender, ok := portal.Bridge.Matrix.(BatchCheckpointSender)
 	if !ok {
 		return fmt.Errorf("matrix connector does not support durable batch replay")
@@ -574,7 +574,7 @@ func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages
 	req := &mautrix.ReqBeeperBatchSend{
 		ForwardIfNoMessages: !forceForward,
 		Forward:             forceForward,
-		SendNotification:    !markRead && forceForward && !inThread,
+		SendNotification:    sendNotification && !markRead && forceForward && !inThread,
 		Events:              out.Events,
 	}
 	if markRead {

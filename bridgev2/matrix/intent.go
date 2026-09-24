@@ -46,6 +46,17 @@ type ASIntent struct {
 var _ bridgev2.MatrixAPI = (*ASIntent)(nil)
 var _ bridgev2.MarkAsDMMatrixAPI = (*ASIntent)(nil)
 
+func bootstrapSendTransaction(ctx context.Context, extra *bridgev2.MatrixSendExtra) string {
+	if extra.MessageMeta != nil {
+		return bridgev2.BootstrapTransactionIDForPart(ctx, fmt.Sprintf("message:%q:%q", extra.MessageMeta.ID, extra.MessageMeta.PartID))
+	}
+	if extra.ReactionMeta != nil {
+		r := extra.ReactionMeta
+		return bridgev2.BootstrapTransactionIDForPart(ctx, fmt.Sprintf("reaction:%q:%q:%q:%q", r.MessageID, r.MessagePartID, r.SenderID, r.EmojiID))
+	}
+	return bridgev2.BootstrapTransactionID(ctx)
+}
+
 func (as *ASIntent) SendMessage(ctx context.Context, roomID id.RoomID, eventType event.Type, content *event.Content, extra *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {
 	if extra == nil {
 		extra = &bridgev2.MatrixSendExtra{}
@@ -61,6 +72,7 @@ func (as *ASIntent) SendMessage(ctx context.Context, roomID id.RoomID, eventType
 		}
 		return as.Matrix.RedactEvent(ctx, roomID, parsedContent.Redacts, mautrix.ReqRedact{
 			Reason: parsedContent.Reason,
+			TxnID:  bootstrapSendTransaction(ctx, extra),
 			Extra:  content.Raw,
 		})
 	}
@@ -89,7 +101,10 @@ func (as *ASIntent) SendMessage(ctx context.Context, roomID id.RoomID, eventType
 			eventType = event.EventEncrypted
 		}
 	}
-	return as.Matrix.SendMessageEvent(ctx, roomID, eventType, content, mautrix.ReqSendEvent{Timestamp: extra.Timestamp.UnixMilli()})
+	return as.Matrix.SendMessageEvent(ctx, roomID, eventType, content, mautrix.ReqSendEvent{
+		Timestamp:     extra.Timestamp.UnixMilli(),
+		TransactionID: bootstrapSendTransaction(ctx, extra),
+	})
 }
 
 func (as *ASIntent) fillMemberEvent(ctx context.Context, roomID id.RoomID, userID id.UserID, content *event.Content) {

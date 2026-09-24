@@ -15,6 +15,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -239,6 +240,23 @@ func (br *Bridge) QueueRemoteEvent(login *UserLogin, evt RemoteEvent) EventHandl
 	key := evt.GetPortalKey()
 	var portal *Portal
 	var err error
+	if evt.GetType() == RemoteEventChatResync {
+		if _, gated := login.Client.(PortalBootstrapSource); gated {
+			job, jobErr := br.DB.GetBootstrapJob(ctx, login.ID, key)
+			if jobErr != nil {
+				return EventHandlingResultFailed.WithError(jobErr)
+			}
+			if job == nil {
+				portal, err = br.GetExistingPortalByKey(ctx, key)
+				if err != nil {
+					return EventHandlingResultFailed.WithError(err)
+				}
+				if portal == nil || portal.MXID == "" {
+					return EventHandlingResultIgnored
+				}
+			}
+		}
+	}
 	if isUncertain && !br.Config.SplitPortals {
 		portal, err = br.GetExistingPortalByKey(ctx, key)
 		if err == nil && portal == nil {
@@ -265,6 +283,18 @@ func (br *Bridge) QueueRemoteEvent(login *UserLogin, evt RemoteEvent) EventHandl
 			Bool("uncertain_receiver", isUncertain).
 			Msg("Portal not found to handle remote event")
 		return EventHandlingResultIgnored
+	}
+	if _, gated := login.Client.(PortalBootstrapSource); gated && portal.RoomType != database.RoomTypeSpace {
+		job, jobErr := br.DB.GetBootstrapJob(ctx, login.ID, portal.PortalKey)
+		if jobErr != nil {
+			return EventHandlingResultFailed.WithError(jobErr)
+		}
+		if (job == nil && portal.MXID == "") || (job != nil && job.Status != "ready") {
+			if evt.GetType() == RemoteEventChatResync || evt.GetType() == RemoteEventTyping {
+				return EventHandlingResultIgnored
+			}
+			return EventHandlingResultFailed.WithError(ErrBootstrapPending)
+		}
 	}
 	// TODO put this in a better place, and maybe cache to avoid constant db queries
 	login.MarkInPortal(ctx, portal)
