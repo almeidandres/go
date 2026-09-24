@@ -524,16 +524,52 @@ func (portal *Portal) fetchThreadInsideBatch(ctx context.Context, source *UserLo
 }
 
 func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages []*BackfillMessage, forceForward, markRead, inThread bool) error {
+	sender, ok := portal.Bridge.Matrix.(BatchCheckpointSender)
+	if !ok {
+		return fmt.Errorf("matrix connector does not support durable batch replay")
+	}
+	existingCheckpoint, err := portal.Bridge.DB.GetBatchCheckpoint(ctx, portal.PortalKey)
+	if err != nil {
+		return fmt.Errorf("load batch checkpoint: %w", err)
+	}
+	if existingCheckpoint != nil {
+		if existingCheckpoint.RoomID != portal.MXID {
+			return fmt.Errorf("batch checkpoint room changed for %v", portal.PortalKey)
+		}
+		if err = portal.Bridge.replayBatchCheckpoint(ctx, existingCheckpoint); err != nil {
+			return err
+		}
+	}
 	out := &compileBatchOutput{
 		PrevThreadEvents: make(map[networkid.MessageID]id.EventID),
 		Events:           make([]*event.Event, 0, len(messages)),
 		Extras:           make([]*MatrixSendExtra, 0, len(messages)),
 		DBMessages:       make([]*database.Message, 0, len(messages)),
-		DBReactions:      make([]*database.Reaction, 0),
-		Disappear:        make([]*database.DisappearingMessage, 0),
 	}
 	for _, msg := range messages {
+		// A previous checkpoint may have committed before the caller fetched this page.
+		mapped, missing := 0, 0
+		for _, part := range msg.Parts {
+			previous, err := portal.Bridge.DB.Message.GetPartByID(ctx, portal.Receiver, msg.ID, part.ID)
+			if err != nil {
+				return fmt.Errorf("check existing backfill message: %w", err)
+			}
+			if previous == nil {
+				missing++
+			} else {
+				mapped++
+			}
+		}
+		if mapped > 0 && missing > 0 {
+			return fmt.Errorf("partially mapped backfill message %s", msg.ID)
+		}
+		if mapped > 0 {
+			continue
+		}
 		portal.compileBatchMessage(ctx, source, msg, out, inThread)
+	}
+	if len(out.DBMessages) == 0 && len(out.Events) == 0 {
+		return nil
 	}
 	req := &mautrix.ReqBeeperBatchSend{
 		ForwardIfNoMessages: !forceForward,
@@ -544,46 +580,19 @@ func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages
 	if markRead {
 		req.MarkReadBy = source.UserMXID
 	}
-	_, err := portal.Bridge.Matrix.BatchSend(ctx, portal.MXID, req, out.Extras)
+	body, err := sender.PrepareBatchSend(ctx, portal.MXID, req)
 	if err != nil {
-		zerolog.Ctx(ctx).Err(err).Msg("Failed to send backfill messages")
+		return fmt.Errorf("prepare batch: %w", err)
+	}
+	data, err := makeBatchCheckpointData(body, out)
+	if err != nil {
 		return err
 	}
-	if len(out.Disappear) > 0 {
-		// TODO mass insert disappearing messages
-		go func() {
-			for _, msg := range out.Disappear {
-				portal.Bridge.DisappearLoop.Add(ctx, msg)
-			}
-		}()
+	cp := &database.BatchCheckpoint{Portal: portal.PortalKey, RoomID: portal.MXID, Data: data}
+	if err = portal.Bridge.DB.InsertBatchCheckpoint(ctx, cp); err != nil {
+		return fmt.Errorf("save batch checkpoint: %w", err)
 	}
-	// TODO mass insert db messages
-	for _, msg := range out.DBMessages {
-		err = portal.Bridge.DB.Message.Insert(ctx, msg)
-		if err != nil {
-			zerolog.Ctx(ctx).Err(err).
-				Str("message_id", string(msg.ID)).
-				Str("part_id", string(msg.PartID)).
-				Str("sender_id", string(msg.SenderID)).
-				Str("portal_id", string(msg.Room.ID)).
-				Str("portal_receiver", string(msg.Room.Receiver)).
-				Msg("Failed to insert backfilled message to database")
-		}
-	}
-	// TODO mass insert db reactions
-	for _, react := range out.DBReactions {
-		err = portal.Bridge.DB.Reaction.Upsert(ctx, react)
-		if err != nil {
-			zerolog.Ctx(ctx).Err(err).
-				Str("message_id", string(react.MessageID)).
-				Str("part_id", string(react.MessagePartID)).
-				Str("sender_id", string(react.SenderID)).
-				Str("portal_id", string(react.Room.ID)).
-				Str("portal_receiver", string(react.Room.Receiver)).
-				Msg("Failed to insert backfilled reaction to database")
-		}
-	}
-	return nil
+	return portal.Bridge.replayBatchCheckpoint(ctx, cp)
 }
 
 func (portal *Portal) sendLegacyBackfill(ctx context.Context, source *UserLogin, messages []*BackfillMessage, markRead bool) error {

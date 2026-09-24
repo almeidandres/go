@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -707,6 +708,14 @@ func (br *Connector) isEncrypted(ctx context.Context, roomID id.RoomID) (bool, e
 }
 
 func (br *Connector) BatchSend(ctx context.Context, roomID id.RoomID, req *mautrix.ReqBeeperBatchSend, extras []*bridgev2.MatrixSendExtra) (*mautrix.RespBeeperBatchSend, error) {
+	body, err := br.PrepareBatchSend(ctx, roomID, req)
+	if err != nil {
+		return nil, err
+	}
+	return br.SendPreparedBatch(ctx, roomID, body)
+}
+
+func (br *Connector) PrepareBatchSend(ctx context.Context, roomID id.RoomID, req *mautrix.ReqBeeperBatchSend) ([]byte, error) {
 	if encrypted, err := br.isEncrypted(ctx, roomID); err != nil {
 		return nil, fmt.Errorf("failed to check if room is encrypted: %w", err)
 	} else if encrypted {
@@ -727,7 +736,19 @@ func (br *Connector) BatchSend(ctx context.Context, roomID id.RoomID, req *mautr
 			}
 		}
 	}
-	return br.Bot.BeeperBatchSend(ctx, roomID, req)
+	return json.Marshal(req)
+}
+
+func (br *Connector) SendPreparedBatch(ctx context.Context, roomID id.RoomID, body []byte) (*mautrix.RespBeeperBatchSend, error) {
+	var resp *mautrix.RespBeeperBatchSend
+	_, err := br.Bot.MakeFullRequest(ctx, mautrix.FullRequest{
+		Method:       http.MethodPost,
+		URL:          br.Bot.BuildClientURL("unstable", "com.beeper.backfill", "rooms", roomID, "batch_send"),
+		Headers:      http.Header{"Content-Type": []string{"application/json"}},
+		RequestBytes: body,
+		ResponseJSON: &resp,
+	})
+	return resp, err
 }
 
 func (br *Connector) GenerateDeterministicEventID(roomID id.RoomID, _ networkid.PortalKey, messageID networkid.MessageID, partID networkid.PartID) id.EventID {

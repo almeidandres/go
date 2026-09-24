@@ -71,6 +71,12 @@ type MatrixConnector interface {
 	ServerName() string
 }
 
+// BatchCheckpointSender prepares encrypted events once, then sends the saved JSON bytes unchanged.
+type BatchCheckpointSender interface {
+	PrepareBatchSend(ctx context.Context, roomID id.RoomID, req *mautrix.ReqBeeperBatchSend) ([]byte, error)
+	SendPreparedBatch(ctx context.Context, roomID id.RoomID, body []byte) (*mautrix.RespBeeperBatchSend, error)
+}
+
 type MatrixConnectorWithArbitraryRoomState interface {
 	MatrixConnector
 	GetStateEvent(ctx context.Context, roomID id.RoomID, eventType event.Type, stateKey string) (*event.Event, error)

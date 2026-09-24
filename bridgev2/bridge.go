@@ -364,6 +364,11 @@ func (br *Bridge) MigrateToSplitPortals(ctx context.Context) (bool, func(), erro
 }
 
 func (br *Bridge) StartLogins(ctx context.Context) error {
+	if !br.Background {
+		if err := br.replayPendingBatches(ctx); err != nil {
+			return fmt.Errorf("recover batch checkpoints before starting backfill: %w", err)
+		}
+	}
 	userIDs, err := br.DB.UserLogin.GetAllUserIDsWithLogins(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get users with logins: %w", err)
