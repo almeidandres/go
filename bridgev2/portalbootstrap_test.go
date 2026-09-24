@@ -180,6 +180,56 @@ func (intent *partialBootstrapIntentTest) SendMessage(_ context.Context, _ id.Ro
 	return &mautrix.RespSendEvent{EventID: id.EventID("$" + string(extra.MessageMeta.PartID))}, nil
 }
 
+func TestPublishedCachedPortalReplaysLiveEventsAfterLateHistory(t *testing.T) {
+	ctx := context.Background()
+	raw, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "published.db")+"?_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	db := database.New("wa", database.MetaTypes{}, raw)
+	if err = db.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key := networkid.PortalKey{ID: "thread", Receiver: "login"}
+	if err = db.Portal.Insert(ctx, &database.Portal{PortalKey: key, MXID: "!room:localhost"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.StageBootstrapPage(ctx, "login", key, []database.BootstrapItem{
+		{StableID: "older", Kind: "history", Version: 1, Payload: "older", SourceTS: 1},
+	}, "phone:waiting", false); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.StageBootstrapIncoming(ctx, "login", key, database.BootstrapItem{StableID: "live", Kind: "incoming", Version: 1, Payload: "live", SourceTS: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(ctx, `UPDATE portal_bootstrap SET published_cached=true,status='reconcile' WHERE portal_id=$1`, key.ID); err != nil {
+		t.Fatal(err)
+	}
+	var replayed []string
+	client := gatedSourceTest{replay: func(item database.BootstrapItem) error {
+		replayed = append(replayed, item.StableID)
+		return nil
+	}}
+	login := &UserLogin{UserLogin: &database.UserLogin{ID: "login", UserMXID: "@owner:localhost"}, Client: client}
+	portal := &Portal{Portal: &database.Portal{PortalKey: key, MXID: "!room:localhost"},
+		Bridge: &Bridge{DB: db, Matrix: bootstrapMatrixTest{}, Bot: bootstrapBotTest{}}, Log: zerolog.Nop()}
+	if err = portal.finishBootstrapInLoop(ctx, login); err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 1 || replayed[0] != "live" {
+		t.Fatalf("late history replayed or live event lost: %v", replayed)
+	}
+	job, err := db.GetBootstrapJob(ctx, login.ID, key)
+	if err != nil || job.Status != "reconcile" || !job.PublishedCached {
+		t.Fatalf("live replay cleared late-history quarantine: %+v %v", job, err)
+	}
+	items, err := db.GetPendingBootstrapItems(ctx, login.ID, key, 10)
+	if err != nil || len(items) != 1 || items[0].StableID != "older" {
+		t.Fatalf("late history was not retained: %+v %v", items, err)
+	}
+}
+
 func TestBootstrapPartialMessageRetry(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "parts.db")

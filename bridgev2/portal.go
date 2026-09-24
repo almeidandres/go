@@ -5255,7 +5255,7 @@ func (portal *Portal) createMatrixRoom(ctx context.Context, source *UserLogin, i
 		if job == nil || job.Status == "ready" {
 			return nil
 		}
-		if job.Status == "reconcile" {
+		if job.Status == "reconcile" && !job.PublishedCached {
 			return ErrBootstrapNeedsReconciliation
 		}
 		// Resume an occupied room without creating another Matrix room.
@@ -5383,7 +5383,7 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 					}
 				}
 			}()
-			if !bootstrap.SourceComplete {
+			if !bootstrap.SourceComplete && !bootstrap.PublishRequested {
 				if err = history.StageBootstrapHistory(cancellableCtx, portal); err != nil {
 					return fmt.Errorf("stage selected chat history: %w", err)
 				}
@@ -5391,7 +5391,7 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 				if err != nil {
 					return err
 				}
-				if bootstrap == nil || !bootstrap.SourceComplete {
+				if bootstrap == nil || (!bootstrap.SourceComplete && !bootstrap.PublishRequested) {
 					return ErrBootstrapPending
 				}
 			}

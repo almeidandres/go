@@ -134,6 +134,88 @@ func TestBootstrapPageAndIncomingRecovery(t *testing.T) {
 	}
 }
 
+func TestCachedPublicationQuarantinesLateHistoryWithoutBlockingIncoming(t *testing.T) {
+	ctx := context.Background()
+	raw, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "cached.db")+"?_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	db := New("wa", MetaTypes{}, raw)
+	if err = db.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	login := networkid.UserLoginID("login")
+	key := networkid.PortalKey{ID: "thread", Receiver: login}
+	portal := &Portal{PortalKey: key}
+	if err = db.Portal.Insert(ctx, portal); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.EnsureBootstrapJob(ctx, login, key); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RequestCachedPublication(ctx, login, key); err == nil {
+		t.Fatal("published an empty selected chat")
+	}
+	cached := BootstrapItem{StableID: "cached", Kind: "history", Version: 1, Payload: "cached", SourceTS: 2}
+	if err = db.StageBootstrapPage(ctx, login, key, []BootstrapItem{cached}, "phone:waiting", false); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.RequestCachedPublication(ctx, login, key); err != nil {
+		t.Fatal(err)
+	}
+	job, err := db.GetBootstrapJob(ctx, login, key)
+	if err != nil || !job.PublishRequested || job.SourceComplete || job.PublishedCached {
+		t.Fatalf("cached publication lied about source: %+v %v", job, err)
+	}
+	if err = db.SetBootstrapStatus(ctx, login, key, "importing", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MarkCachedPublished(ctx, login, key); err == nil {
+		t.Fatal("released cached room before Matrix room exists")
+	}
+	portal.MXID = "!room:localhost"
+	if err = db.Portal.Update(ctx, portal); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MarkCachedPublished(ctx, login, key); err == nil {
+		t.Fatal("released cached room before message delivery")
+	}
+	if err = db.Ghost.Insert(ctx, &Ghost{ID: "sender"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Message.Insert(ctx, &Message{Room: key, ID: "cached", MXID: "$cached", SenderID: "sender", SenderMXID: "@sender:localhost", Timestamp: time.UnixMilli(2)}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MarkBootstrapDelivered(ctx, login, key, cached.StableID); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.MarkCachedPublished(ctx, login, key); err != nil {
+		t.Fatal(err)
+	}
+	job, err = db.GetBootstrapJob(ctx, login, key)
+	if err != nil || job.Status != "incomplete" || job.SourceComplete || !job.PublishedCached {
+		t.Fatalf("cached portal claimed complete source: %+v %v", job, err)
+	}
+	if err = db.StageBootstrapPage(ctx, login, key, []BootstrapItem{{StableID: "older", Kind: "history", Version: 1, Payload: "older", SourceTS: 1}}, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.StageBootstrapIncoming(ctx, login, key, BootstrapItem{StableID: "live", Kind: "incoming", Version: 1, Payload: "live", SourceTS: 3}); err != nil {
+		t.Fatal(err)
+	}
+	job, err = db.GetBootstrapJob(ctx, login, key)
+	if err != nil || job.Status != "reconcile" || !job.PublishedCached {
+		t.Fatalf("older history was not quarantined: %+v %v", job, err)
+	}
+	jobs, err := db.GetUnfinishedBootstrapJobs(ctx, login)
+	if err != nil || len(jobs) != 1 || !jobs[0].PublishedCached {
+		t.Fatalf("live delivery was blocked by old history: %+v %v", jobs, err)
+	}
+	if err = db.SetBootstrapStatus(ctx, login, key, "ready", ""); err == nil {
+		t.Fatal("published cached history falsely marked ready")
+	}
+}
+
 func TestBootstrapOlderHistoryAfterInterruptedRoom(t *testing.T) {
 	ctx := context.Background()
 	raw, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "late.db")+"?_foreign_keys=on", "sqlite3")

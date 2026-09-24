@@ -153,6 +153,10 @@ func (portal *Portal) HandleBootstrapEvent(ctx context.Context, source *UserLogi
 
 // ReplayBootstrapIncoming confirms each event only after synchronous handling finishes.
 func (portal *Portal) ReplayBootstrapIncoming(ctx context.Context, source *UserLogin) error {
+	return portal.replayBootstrapIncoming(ctx, source, false)
+}
+
+func (portal *Portal) replayBootstrapIncoming(ctx context.Context, source *UserLogin, quarantineHistory bool) error {
 	if portal.MXID == "" || source == nil || source.Client == nil {
 		return fmt.Errorf("bootstrap replay requires a Matrix room and source login")
 	}
@@ -174,6 +178,9 @@ func (portal *Portal) ReplayBootstrapIncoming(ctx context.Context, source *UserL
 			for _, item := range items {
 				after = item.Order
 				if item.Kind == "history" {
+					if quarantineHistory {
+						continue
+					}
 					return fmt.Errorf("history item %s was not imported before incoming replay", item.StableID)
 				}
 				prefix := fmt.Sprintf("%q/%q/%q/%q/%q/%q", portal.Bridge.ID, source.ID, portal.ID, portal.Receiver, portal.MXID, item.StableID)
@@ -300,6 +307,15 @@ func (portal *Portal) finishBootstrapInLoop(ctx context.Context, source *UserLog
 	if job.Status == "ready" {
 		return nil
 	}
+	if job.PublishedCached {
+		if job.Status != "incomplete" && job.Status != "reconcile" {
+			return fmt.Errorf("published cached portal has invalid status %s", job.Status)
+		}
+		if err := portal.verifyBootstrapRoomState(ctx, source, portal.MXID); err != nil {
+			return err
+		}
+		return portal.replayBootstrapIncoming(ctx, source, true)
+	}
 	if job.Status == "reconcile" {
 		return ErrBootstrapNeedsReconciliation
 	}
@@ -312,7 +328,7 @@ func (portal *Portal) finishBootstrapInLoop(ctx context.Context, source *UserLog
 			}
 		}
 	}()
-	if !job.SourceComplete {
+	if !job.SourceComplete && !job.PublishRequested {
 		if err := history.StageBootstrapHistory(ctx, portal); err != nil {
 			return fmt.Errorf("stage selected chat history: %w", err)
 		}
@@ -339,6 +355,9 @@ func (portal *Portal) finishBootstrapInLoop(ctx context.Context, source *UserLog
 	if err := portal.ReplayBootstrapIncoming(ctx, source); err != nil {
 		return err
 	}
+	if !job.SourceComplete {
+		return portal.Bridge.DB.MarkCachedPublished(ctx, source.ID, portal.PortalKey)
+	}
 	if err := portal.Bridge.DB.SetBootstrapStatus(ctx, source.ID, portal.PortalKey, "ready", ""); err != nil {
 		return fmt.Errorf("confirm imported portal ready: %w", err)
 	}
@@ -359,10 +378,17 @@ func (portal *Portal) ImportBootstrapHistory(ctx context.Context, source *UserLo
 	if err != nil {
 		return err
 	}
-	if job == nil || !job.SourceComplete {
+	if job == nil || (!job.SourceComplete && !job.PublishRequested) {
 		return fmt.Errorf("source history is not complete for %s", portal.ID)
 	}
 	for {
+		job, err = portal.Bridge.DB.GetBootstrapJob(ctx, source.ID, portal.PortalKey)
+		if err != nil {
+			return err
+		}
+		if job.Status == "reconcile" {
+			return ErrBootstrapNeedsReconciliation
+		}
 		items, err := portal.Bridge.DB.GetPendingBootstrapHistory(ctx, source.ID, portal.PortalKey, 100)
 		if err != nil {
 			return err

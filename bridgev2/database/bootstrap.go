@@ -19,12 +19,14 @@ const (
 )
 
 type BootstrapJob struct {
-	LoginID        networkid.UserLoginID
-	Portal         networkid.PortalKey
-	Status         string
-	Cursor         string
-	SourceComplete bool
-	LastError      string
+	LoginID          networkid.UserLoginID
+	Portal           networkid.PortalKey
+	Status           string
+	Cursor           string
+	SourceComplete   bool
+	PublishRequested bool
+	PublishedCached  bool
+	LastError        string
 }
 
 type BootstrapItem struct {
@@ -39,9 +41,9 @@ type BootstrapItem struct {
 
 func (db *Database) GetBootstrapJob(ctx context.Context, login networkid.UserLoginID, portal networkid.PortalKey) (*BootstrapJob, error) {
 	job := &BootstrapJob{LoginID: login, Portal: portal}
-	err := db.QueryRow(ctx, `SELECT status, cursor, source_complete, COALESCE(last_error, '') FROM portal_bootstrap
+	err := db.QueryRow(ctx, `SELECT status, cursor, source_complete, publish_requested, published_cached, COALESCE(last_error, '') FROM portal_bootstrap
 		WHERE bridge_id=$1 AND user_login_id=$2 AND portal_id=$3 AND portal_receiver=$4`,
-		db.BridgeID, login, portal.ID, portal.Receiver).Scan(&job.Status, &job.Cursor, &job.SourceComplete, &job.LastError)
+		db.BridgeID, login, portal.ID, portal.Receiver).Scan(&job.Status, &job.Cursor, &job.SourceComplete, &job.PublishRequested, &job.PublishedCached, &job.LastError)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -50,8 +52,9 @@ func (db *Database) GetBootstrapJob(ctx context.Context, login networkid.UserLog
 
 // GetUnfinishedBootstrapJobs returns selected chats that require import or replay.
 func (db *Database) GetUnfinishedBootstrapJobs(ctx context.Context, login networkid.UserLoginID) ([]BootstrapJob, error) {
-	rows, err := db.Query(ctx, `SELECT portal_id, portal_receiver, status, cursor, source_complete, COALESCE(last_error, '')
-		FROM portal_bootstrap WHERE bridge_id=$1 AND user_login_id=$2 AND status NOT IN ('ready', 'reconcile') ORDER BY updated_at`, db.BridgeID, login)
+	rows, err := db.Query(ctx, `SELECT portal_id, portal_receiver, status, cursor, source_complete, publish_requested, published_cached, COALESCE(last_error, '')
+		FROM portal_bootstrap WHERE bridge_id=$1 AND user_login_id=$2
+		AND (status NOT IN ('ready', 'reconcile') OR (status='reconcile' AND published_cached=true)) ORDER BY updated_at`, db.BridgeID, login)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +63,7 @@ func (db *Database) GetUnfinishedBootstrapJobs(ctx context.Context, login networ
 	for rows.Next() {
 		var job BootstrapJob
 		job.LoginID = login
-		if err = rows.Scan(&job.Portal.ID, &job.Portal.Receiver, &job.Status, &job.Cursor, &job.SourceComplete, &job.LastError); err != nil {
+		if err = rows.Scan(&job.Portal.ID, &job.Portal.Receiver, &job.Status, &job.Cursor, &job.SourceComplete, &job.PublishRequested, &job.PublishedCached, &job.LastError); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -100,7 +103,8 @@ func (db *Database) stageBootstrapItem(ctx context.Context, login networkid.User
 	}
 	var order int64
 	err = db.QueryRow(ctx, `UPDATE portal_bootstrap SET next_order=next_order+1, updated_at=$5,
-		status=CASE WHEN $6='history' AND EXISTS (
+		status=CASE WHEN $6='history' AND published_cached=true THEN 'reconcile'
+		WHEN $6='history' AND EXISTS (
 			SELECT 1 FROM message m WHERE m.bridge_id=$1 AND m.room_id=$3 AND m.room_receiver=$4
 			AND m.timestamp >= $7 AND m.mxid NOT LIKE '~fake:%'
 		) THEN 'reconcile' WHEN status='ready' AND $6='history' THEN 'reconcile'
@@ -288,6 +292,51 @@ func (db *Database) AdoptBootstrapRoom(ctx context.Context, login networkid.User
 		}
 		return nil
 	})
+}
+
+// RequestCachedPublication authorizes only a selected, unchanged phone-history
+// snapshot. It never asserts that the primary phone sent all older messages.
+func (db *Database) RequestCachedPublication(ctx context.Context, login networkid.UserLoginID, portal networkid.PortalKey) error {
+	result, err := db.Exec(ctx, `UPDATE portal_bootstrap SET publish_requested=true, updated_at=$5
+		WHERE bridge_id=$1 AND user_login_id=$2 AND portal_id=$3 AND portal_receiver=$4
+		AND status='pending' AND last_error IS NULL AND source_complete=false
+		AND published_cached=false AND cursor LIKE 'phone:%'
+		AND EXISTS (SELECT 1 FROM portal_bootstrap_item i WHERE i.bridge_id=$1 AND i.user_login_id=$2
+			AND i.portal_id=$3 AND i.portal_receiver=$4 AND i.kind='history' AND i.delivered=false)
+		AND EXISTS (SELECT 1 FROM portal p WHERE p.bridge_id=$1 AND p.id=$3 AND p.receiver=$4 AND COALESCE(p.mxid,'')='')
+		AND NOT EXISTS (SELECT 1 FROM message m WHERE m.bridge_id=$1 AND m.room_id=$3 AND m.room_receiver=$4)`,
+		db.BridgeID, login, portal.ID, portal.Receiver, time.Now().UnixNano())
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return err
+	} else if count != 1 {
+		return fmt.Errorf("selected portal %s is not eligible for cached publication", portal.ID)
+	}
+	return nil
+}
+
+// MarkCachedPublished releases live delivery only after all cached history and
+// staged incoming events have durable mappings and delivery checkpoints.
+func (db *Database) MarkCachedPublished(ctx context.Context, login networkid.UserLoginID, portal networkid.PortalKey) error {
+	result, err := db.Exec(ctx, `UPDATE portal_bootstrap SET status='incomplete', published_cached=true,
+		last_error='Cached messages published; older phone history pending', updated_at=$5
+		WHERE bridge_id=$1 AND user_login_id=$2 AND portal_id=$3 AND portal_receiver=$4
+		AND status='importing' AND publish_requested=true AND source_complete=false
+		AND EXISTS (SELECT 1 FROM portal p WHERE p.bridge_id=$1 AND p.id=$3 AND p.receiver=$4 AND COALESCE(p.mxid,'')<>'')
+		AND NOT EXISTS (SELECT 1 FROM portal_bootstrap_item i WHERE i.bridge_id=$1 AND i.user_login_id=$2
+			AND i.portal_id=$3 AND i.portal_receiver=$4 AND i.delivered=false)`,
+		db.BridgeID, login, portal.ID, portal.Receiver, time.Now().UnixNano())
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return err
+	} else if count != 1 {
+		return fmt.Errorf("cached portal %s still has pending history or incoming events", portal.ID)
+	}
+	return nil
 }
 
 func (db *Database) SetBootstrapStatus(ctx context.Context, login networkid.UserLoginID, portal networkid.PortalKey, status, lastError string) error {

@@ -148,6 +148,8 @@ func fnBootstrapStatus(ce *Event) {
 		}
 	} else if job.Status == "ready" {
 		ce.Reply("Portal %s: ready. Source-reported history window imported; older unavailable history may still exist.", portalID)
+	} else if job.PublishedCached {
+		ce.Reply("Portal %s: %s. Cached history published; live messages continue. Older phone history remains incomplete or needs review.", portalID, format.SafeMarkdownCode(job.Status))
 	} else if job.Status == "reconcile" {
 		ce.Reply("Portal %s: reconcile. Operator review required; automatic room creation and history insertion remain blocked.", portalID)
 	} else {
