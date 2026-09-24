@@ -199,6 +199,91 @@ func (portal *Portal) ReplayBootstrapIncoming(ctx context.Context, source *UserL
 	}
 }
 
+func (portal *Portal) verifyBootstrapRoomState(ctx context.Context, source *UserLogin, roomID id.RoomID) error {
+	stateReader, ok := portal.Bridge.Matrix.(MatrixConnectorWithArbitraryRoomState)
+	if !ok {
+		return fmt.Errorf("encrypted portal import requires Matrix room-state access")
+	}
+	for _, userID := range []id.UserID{portal.Bridge.Bot.GetMXID(), source.UserMXID} {
+		state, err := stateReader.GetStateEvent(ctx, roomID, event.StateMember, userID.String())
+		if err != nil {
+			return fmt.Errorf("verify portal member %s: %w", userID, err)
+		}
+		if state == nil || state.Content.AsMember().Membership != event.MembershipJoin {
+			return fmt.Errorf("portal member %s is not joined; encrypted history remains pending", userID)
+		}
+	}
+	state, err := stateReader.GetStateEvent(ctx, roomID, event.StateEncryption, "")
+	if err != nil {
+		return fmt.Errorf("verify encrypted portal state: %w", err)
+	}
+	if state == nil {
+		return fmt.Errorf("portal encryption is missing; history remains pending")
+	}
+	content, ok := state.Content.Parsed.(*event.EncryptionEventContent)
+	if !ok || content.Algorithm != id.AlgorithmMegolmV1 {
+		return fmt.Errorf("portal encryption is unsupported; history remains pending")
+	}
+	return nil
+}
+
+// AdoptBootstrapRoom binds a verified orphan room after uncertain creation.
+// Late-history reconciliation is never eligible for adoption.
+func (portal *Portal) AdoptBootstrapRoom(ctx context.Context, source *UserLogin, roomID id.RoomID) error {
+	if source == nil || source.UserLogin == nil || source.UserMXID == "" || roomID == "" {
+		return fmt.Errorf("room adoption requires a source login and Matrix room ID")
+	}
+	if _, ok := source.Client.(PortalBootstrapSource); !ok {
+		return fmt.Errorf("source login cannot import portal history")
+	}
+	portal.roomCreateLock.Lock()
+	defer portal.roomCreateLock.Unlock()
+	if portal.MXID != "" {
+		return fmt.Errorf("portal already has a Matrix room")
+	}
+	stateReader, ok := portal.Bridge.Matrix.(MatrixConnectorWithArbitraryRoomState)
+	if !ok {
+		return fmt.Errorf("room adoption requires Matrix room-state access")
+	}
+	botID := portal.Bridge.Bot.GetMXID()
+	create, err := stateReader.GetStateEvent(ctx, roomID, event.StateCreate, "")
+	if err != nil {
+		return fmt.Errorf("verify Matrix room creator: %w", err)
+	}
+	if create == nil || create.Sender != botID {
+		return fmt.Errorf("Matrix room was not created by this bridge bot")
+	}
+	stateKey, expected := portal.getBridgeInfo()
+	if expected.Protocol.ID == "" {
+		return fmt.Errorf("bridge protocol has no identity")
+	}
+	state, err := stateReader.GetStateEvent(ctx, roomID, event.StateBridge, stateKey)
+	if err != nil {
+		return fmt.Errorf("verify Matrix bridge identity: %w", err)
+	}
+	if state == nil {
+		return fmt.Errorf("Matrix room has no bridge identity")
+	}
+	info, ok := state.Content.Parsed.(*event.BridgeEventContent)
+	if !ok || info.BridgeBot != botID || info.Protocol.ID != expected.Protocol.ID ||
+		info.Channel.ID != expected.Channel.ID || info.Channel.Receiver != expected.Channel.Receiver {
+		return fmt.Errorf("Matrix room belongs to a different bridge or chat")
+	}
+	if err := portal.verifyBootstrapRoomState(ctx, source, roomID); err != nil {
+		return err
+	}
+	if err := portal.Bridge.DB.AdoptBootstrapRoom(ctx, source.ID, portal.PortalKey, roomID); err != nil {
+		return err
+	}
+	portal.MXID = roomID
+	portal.Bridge.cacheLock.Lock()
+	portal.Bridge.portalsByMXID[roomID] = portal
+	portal.Bridge.cacheLock.Unlock()
+	portal.RoomCreated.Set()
+	portal.updateLogger()
+	return nil
+}
+
 // finishBootstrapInLoop resumes an occupied room after a crash or a failed import.
 func (portal *Portal) finishBootstrapInLoop(ctx context.Context, source *UserLogin) (retErr error) {
 	history, ok := source.Client.(PortalBootstrapSource)
@@ -245,27 +330,8 @@ func (portal *Portal) finishBootstrapInLoop(ctx context.Context, source *UserLog
 	if err := portal.Bridge.DB.SetBootstrapStatus(ctx, source.ID, portal.PortalKey, "importing", ""); err != nil {
 		return err
 	}
-	stateReader, ok := portal.Bridge.Matrix.(MatrixConnectorWithArbitraryRoomState)
-	if !ok {
-		return fmt.Errorf("encrypted portal import requires Matrix room-state access")
-	}
-	ownerState, err := stateReader.GetStateEvent(ctx, portal.MXID, event.StateMember, source.UserMXID.String())
-	if err != nil {
-		return fmt.Errorf("verify portal owner joined before encrypted history: %w", err)
-	}
-	if ownerState == nil || ownerState.Content.AsMember().Membership != event.MembershipJoin {
-		return fmt.Errorf("portal owner is not joined; encrypted history remains pending")
-	}
-	state, err := stateReader.GetStateEvent(ctx, portal.MXID, event.StateEncryption, "")
-	if err != nil {
-		return fmt.Errorf("verify encrypted portal state: %w", err)
-	}
-	if state == nil {
-		return fmt.Errorf("portal encryption is missing; history remains pending")
-	}
-	content, ok := state.Content.Parsed.(*event.EncryptionEventContent)
-	if !ok || content.Algorithm != id.AlgorithmMegolmV1 {
-		return fmt.Errorf("portal encryption is unsupported; history remains pending")
+	if err := portal.verifyBootstrapRoomState(ctx, source, portal.MXID); err != nil {
+		return err
 	}
 	if err := portal.ImportBootstrapHistory(ctx, source); err != nil {
 		return err

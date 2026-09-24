@@ -99,4 +99,9 @@ func TestBootstrapStatusDoesNotExposeOtherLogin(t *testing.T) {
 	if err != nil || job.Status != "pending" {
 		t.Fatalf("read-only status changed bootstrap job: %+v %v", job, err)
 	}
+	ce.Args = []string{"other", "private-chat", "!orphan:localhost"}
+	CommandBootstrapAdoptRoom.Run(ce)
+	if !strings.Contains(bot.message, "limited to bridge administrators") {
+		t.Fatalf("non-admin reached room adoption: %q", bot.message)
+	}
 }

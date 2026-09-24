@@ -9,6 +9,13 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/id"
+)
+
+const (
+	BootstrapRoomCreationInterrupted = "room creation outcome unknown after interruption"
+	BootstrapRoomCreationFailed      = "room creation request failed; outcome unknown"
+	BootstrapRoomMappingFailed       = "Matrix room exists but portal mapping was not saved"
 )
 
 type BootstrapJob struct {
@@ -247,6 +254,40 @@ func (db *Database) MarkBootstrapDelivered(ctx context.Context, login networkid.
 		return fmt.Errorf("bootstrap item %s not found", stableID)
 	}
 	return nil
+}
+
+// AdoptBootstrapRoom atomically binds a verified orphan room and releases only
+// reconciliation caused by an uncertain room-creation result.
+func (db *Database) AdoptBootstrapRoom(ctx context.Context, login networkid.UserLoginID, portal networkid.PortalKey, roomID id.RoomID) error {
+	return db.DoTxn(ctx, nil, func(txCtx context.Context) error {
+		result, err := db.Exec(txCtx, `UPDATE portal_bootstrap SET status='incomplete',
+			last_error='Existing Matrix room verified; import pending', updated_at=$5
+			WHERE bridge_id=$1 AND user_login_id=$2 AND portal_id=$3 AND portal_receiver=$4
+			AND status='reconcile' AND last_error IN ($6,$7,$8)`,
+			db.BridgeID, login, portal.ID, portal.Receiver, time.Now().UnixNano(),
+			BootstrapRoomCreationInterrupted, BootstrapRoomCreationFailed, BootstrapRoomMappingFailed)
+		if err != nil {
+			return err
+		}
+		if count, err := result.RowsAffected(); err != nil {
+			return err
+		} else if count != 1 {
+			return fmt.Errorf("bootstrap %s is not eligible for room adoption", portal.ID)
+		}
+		result, err = db.Exec(txCtx, `UPDATE portal SET mxid=$4 WHERE bridge_id=$1 AND id=$2 AND receiver=$3
+			AND COALESCE(mxid,'')='' AND NOT EXISTS (
+				SELECT 1 FROM message m WHERE m.bridge_id=$1 AND m.room_id=$2 AND m.room_receiver=$3)`,
+			db.BridgeID, portal.ID, portal.Receiver, roomID)
+		if err != nil {
+			return err
+		}
+		if count, err := result.RowsAffected(); err != nil {
+			return err
+		} else if count != 1 {
+			return fmt.Errorf("portal %s already has a room or message mappings", portal.ID)
+		}
+		return nil
+	})
 }
 
 func (db *Database) SetBootstrapStatus(ctx context.Context, login networkid.UserLoginID, portal networkid.PortalKey, status, lastError string) error {

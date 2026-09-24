@@ -61,6 +61,44 @@ var CommandBootstrapStatus = &FullHandler{
 	RequiresLogin: true,
 }
 
+var CommandBootstrapAdoptRoom = &FullHandler{
+	Func: fnBootstrapAdoptRoom,
+	Name: "bootstrap-adopt-room",
+	Help: HelpMeta{
+		Section:     HelpSectionChats,
+		Description: "Verify and adopt an orphan room after uncertain portal creation",
+		Args:        "<_login ID_> <_portal ID_> <_room ID_>",
+	},
+	RequiresAdmin: true,
+}
+
+func fnBootstrapAdoptRoom(ce *Event) {
+	if len(ce.Args) != 3 {
+		ce.Reply("Usage: `$cmdprefix bootstrap-adopt-room <login ID> <portal ID> <room ID>`")
+		return
+	}
+	login := ce.Bridge.GetCachedUserLoginByID(networkid.UserLoginID(ce.Args[0]))
+	if login == nil {
+		ce.Reply("Login not found")
+		return
+	}
+	portal, err := ce.Bridge.GetExistingPortalByKey(ce.Ctx, networkid.PortalKey{ID: networkid.PortalID(ce.Args[1]), Receiver: login.ID})
+	if err != nil {
+		ce.Reply("Failed to find selected portal: %v", err)
+		return
+	}
+	if portal == nil {
+		ce.Reply("Selected portal not found")
+		return
+	}
+	if err = portal.AdoptBootstrapRoom(ce.Ctx, login, id.RoomID(ce.Args[2])); err != nil {
+		ce.Reply("Room adoption refused: %v", err)
+		return
+	}
+	login.ResumeBootstrapJobs()
+	ce.Reply("Verified room %s adopted for %s; import will resume.", format.SafeMarkdownCode(ce.Args[2]), format.SafeMarkdownCode(portal.ID))
+}
+
 func fnBootstrapStatus(ce *Event) {
 	if len(ce.Args) < 1 || len(ce.Args) > 2 {
 		ce.Reply("Usage: `$cmdprefix bootstrap-status [login ID] <portal ID>`")

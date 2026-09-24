@@ -5369,7 +5369,7 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 				return ErrBootstrapNeedsReconciliation
 			}
 			if bootstrap.Status == "importing" {
-				if err := portal.Bridge.DB.SetBootstrapStatus(ctx, source.ID, portal.PortalKey, "reconcile", "room creation outcome unknown after interruption"); err != nil {
+				if err := portal.Bridge.DB.SetBootstrapStatus(ctx, source.ID, portal.PortalKey, "reconcile", database.BootstrapRoomCreationInterrupted); err != nil {
 					return err
 				}
 				return ErrBootstrapNeedsReconciliation
@@ -5529,7 +5529,7 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 		if bootstrap != nil {
 			statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
-			if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "reconcile", "room creation request failed; outcome unknown"); statusErr != nil {
+			if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "reconcile", database.BootstrapRoomCreationFailed); statusErr != nil {
 				return fmt.Errorf("%w: room creation: %v; status checkpoint: %v", ErrBootstrapNeedsReconciliation, err, statusErr)
 			}
 			return fmt.Errorf("%w: %v", ErrBootstrapNeedsReconciliation, err)
@@ -5552,7 +5552,7 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 		if bootstrap != nil {
 			statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
-			if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "reconcile", "Matrix room exists but portal mapping was not saved"); statusErr != nil {
+			if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "reconcile", database.BootstrapRoomMappingFailed); statusErr != nil {
 				return fmt.Errorf("%w: room mapping: %v; status checkpoint: %v", ErrBootstrapNeedsReconciliation, err, statusErr)
 			}
 			return fmt.Errorf("%w: %v", ErrBootstrapNeedsReconciliation, err)

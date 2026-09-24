@@ -10,6 +10,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
+	"go.mau.fi/util/exsync"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
@@ -37,6 +38,14 @@ func (g gatedSourceTest) ReplayBootstrapIncoming(_ context.Context, _ *Portal, i
 
 type bootstrapMatrixTest struct{ MatrixConnector }
 
+type bootstrapBotTest struct{ MatrixAPI }
+
+func (bootstrapBotTest) GetMXID() id.UserID { return "@bot:localhost" }
+
+type bootstrapNetworkTest struct{ NetworkConnector }
+
+func (bootstrapNetworkTest) GetName() BridgeName { return BridgeName{BeeperBridgeType: "testbridge"} }
+
 func (bootstrapMatrixTest) GetStateEvent(_ context.Context, _ id.RoomID, evtType event.Type, _ string) (*event.Event, error) {
 	if evtType == event.StateMember {
 		return &event.Event{Content: event.Content{Parsed: &event.MemberEventContent{Membership: event.MembershipJoin}}}, nil
@@ -60,6 +69,100 @@ type chatResyncGateTest struct {
 
 func (e chatResyncGateTest) GetType() RemoteEventType          { return RemoteEventChatResync }
 func (e chatResyncGateTest) GetPortalKey() networkid.PortalKey { return e.key }
+
+type bootstrapAdoptionMatrixTest struct {
+	MatrixConnector
+	protocol    string
+	ownerJoined bool
+}
+
+func (matrix bootstrapAdoptionMatrixTest) GetStateEvent(_ context.Context, _ id.RoomID, typ event.Type, key string) (*event.Event, error) {
+	switch typ {
+	case event.StateCreate:
+		return &event.Event{Sender: "@bot:localhost"}, nil
+	case event.StateBridge:
+		return &event.Event{Content: event.Content{Parsed: &event.BridgeEventContent{
+			BridgeBot: "@bot:localhost", Protocol: event.BridgeInfoSection{ID: matrix.protocol},
+			Channel: event.BridgeInfoSection{ID: "thread"},
+		}}}, nil
+	case event.StateMember:
+		membership := event.MembershipJoin
+		if key == "@owner:localhost" && !matrix.ownerJoined {
+			membership = event.MembershipInvite
+		}
+		return &event.Event{Content: event.Content{Parsed: &event.MemberEventContent{Membership: membership}}}, nil
+	case event.StateEncryption:
+		return &event.Event{Content: event.Content{Parsed: &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1}}}, nil
+	default:
+		return nil, nil
+	}
+}
+
+func TestBootstrapAdoptionVerifiesExistingRoom(t *testing.T) {
+	ctx := context.Background()
+	raw, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "adoption.db")+"?_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	db := database.New("ig", database.MetaTypes{}, raw)
+	if err = db.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key := networkid.PortalKey{ID: "thread"}
+	if err = db.Portal.Insert(ctx, &database.Portal{PortalKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.EnsureBootstrapJob(ctx, "login", key); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.SetBootstrapStatus(ctx, "login", key, "reconcile", database.BootstrapRoomCreationInterrupted); err != nil {
+		t.Fatal(err)
+	}
+	bridge := &Bridge{ID: "ig", DB: db, Bot: bootstrapBotTest{}, Network: bootstrapNetworkTest{},
+		Config: &bridgeconfig.BridgeConfig{}, Log: zerolog.Nop(), portalsByMXID: make(map[id.RoomID]*Portal)}
+	portal := &Portal{Portal: &database.Portal{PortalKey: key}, Bridge: bridge, RoomCreated: exsync.NewEvent()}
+	source := &UserLogin{UserLogin: &database.UserLogin{ID: "login", UserMXID: "@owner:localhost"}, Client: gatedSourceTest{}}
+	for _, state := range []bootstrapAdoptionMatrixTest{{protocol: "wrong", ownerJoined: true}, {protocol: "testbridge", ownerJoined: false}} {
+		bridge.Matrix = state
+		if err = portal.AdoptBootstrapRoom(ctx, source, "!orphan:localhost"); err == nil {
+			t.Fatal("adopted room without valid bridge identity and joined owner")
+		}
+		job, checkErr := db.GetBootstrapJob(ctx, source.ID, key)
+		if checkErr != nil || job.Status != "reconcile" || portal.MXID != "" {
+			t.Fatalf("failed adoption changed job or room: %+v %s %v", job, portal.MXID, checkErr)
+		}
+	}
+	bridge.Matrix = bootstrapAdoptionMatrixTest{protocol: "testbridge", ownerJoined: true}
+	if err = portal.AdoptBootstrapRoom(ctx, source, "!orphan:localhost"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.Portal.GetByKey(ctx, key)
+	if err != nil || stored.MXID != "!orphan:localhost" || portal.MXID != stored.MXID {
+		t.Fatalf("verified orphan room was not bound: %+v %v", stored, err)
+	}
+	job, err := db.GetBootstrapJob(ctx, source.ID, key)
+	if err != nil || job.Status != "incomplete" {
+		t.Fatalf("verified room did not resume pending import: %+v %v", job, err)
+	}
+	lateKey := networkid.PortalKey{ID: "late-history"}
+	if err = db.Portal.Insert(ctx, &database.Portal{PortalKey: lateKey}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.EnsureBootstrapJob(ctx, source.ID, lateKey); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.SetBootstrapStatus(ctx, source.ID, lateKey, "reconcile", "older history needs review"); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.AdoptBootstrapRoom(ctx, source.ID, lateKey, "!other:localhost"); err == nil {
+		t.Fatal("room adoption cleared late-history reconciliation")
+	}
+	job, err = db.GetBootstrapJob(ctx, source.ID, lateKey)
+	if err != nil || job.Status != "reconcile" {
+		t.Fatalf("failed adoption changed late-history status: %+v %v", job, err)
+	}
+}
 
 type partialBootstrapIntentTest struct {
 	MatrixAPI
@@ -185,7 +288,7 @@ func TestBootstrapIncomingReplayRecoversAfterRestart(t *testing.T) {
 	if err := db.StageBootstrapPage(ctx, loginID, key, nil, "", true); err != nil {
 		t.Fatal(err)
 	}
-	portal := &Portal{Portal: &database.Portal{MXID: "!room:localhost", PortalKey: key}, Bridge: &Bridge{DB: db, Matrix: bootstrapMatrixTest{}}, Log: zerolog.Nop()}
+	portal := &Portal{Portal: &database.Portal{MXID: "!room:localhost", PortalKey: key}, Bridge: &Bridge{DB: db, Matrix: bootstrapMatrixTest{}, Bot: bootstrapBotTest{}}, Log: zerolog.Nop()}
 	failed := false
 	source := gatedSourceTest{replay: func(item database.BootstrapItem) error {
 		if item.StableID == "receipt" {
