@@ -45,7 +45,7 @@ func NewProcessor(bridge *bridgev2.Bridge) bridgev2.CommandProcessor {
 		CommandDeletePortal, CommandDeleteAllPortals, CommandSetManagementRoom,
 		CommandLogin, CommandRelogin, CommandListLogins, CommandLogout, CommandSetPreferredLogin,
 		CommandSetRelay, CommandUnsetRelay,
-		CommandResolveIdentifier, CommandStartChat, CommandCreateGroup, CommandSearch, CommandCreatePortal,
+		CommandResolveIdentifier, CommandStartChat, CommandBootstrapStatus, CommandCreateGroup, CommandSearch, CommandCreatePortal,
 		CommandID, CommandUnbridge, CommandBridge, CommandSyncChat, CommandMute, CommandDeleteChat, CommandFilter,
 		CommandSudo, CommandDoIn,
 		CommandImportImagePack,

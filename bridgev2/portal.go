@@ -2031,6 +2031,9 @@ func (portal *Portal) handleMatrixMembership(
 		return EventHandlingResultIgnored.WithMSSError(ErrMembershipNotSupported)
 	}
 	targetMXID := id.UserID(*evt.StateKey)
+	if !isStateRequest && content.Membership == event.MembershipJoin && targetMXID == sender.UserMXID {
+		sender.ResumeBootstrapJobs()
+	}
 	target, err := portal.getTargetUser(ctx, targetMXID)
 	if err != nil {
 		log.Err(err).Msg("Failed to get member event target")

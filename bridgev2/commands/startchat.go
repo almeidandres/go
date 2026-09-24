@@ -50,6 +50,73 @@ var CommandStartChat = &FullHandler{
 	NetworkAPI:    NetworkAPIImplements[bridgev2.IdentifierResolvingNetworkAPI],
 }
 
+var CommandBootstrapStatus = &FullHandler{
+	Func: fnBootstrapStatus,
+	Name: "bootstrap-status",
+	Help: HelpMeta{
+		Section:     HelpSectionChats,
+		Description: "Check a selected chat's import status without retrying it",
+		Args:        "[_login ID_] <_portal ID_>",
+	},
+	RequiresLogin: true,
+}
+
+func fnBootstrapStatus(ce *Event) {
+	if len(ce.Args) < 1 || len(ce.Args) > 2 {
+		ce.Reply("Usage: `$cmdprefix bootstrap-status [login ID] <portal ID>`")
+		return
+	}
+	login := ce.User.GetDefaultLogin()
+	if len(ce.Args) == 2 {
+		login = ce.Bridge.GetCachedUserLoginByID(networkid.UserLoginID(ce.Args[0]))
+	}
+	if login == nil || login.UserMXID != ce.User.MXID {
+		ce.Reply("Login not found or not yours")
+		return
+	}
+	key := networkid.PortalKey{ID: networkid.PortalID(ce.Args[len(ce.Args)-1]), Receiver: login.ID}
+	portal, err := ce.Bridge.GetExistingPortalByKey(ce.Ctx, key)
+	if err != nil {
+		ce.Reply("Failed to check portal: %v", err)
+		return
+	}
+	if portal != nil {
+		key = portal.PortalKey
+	}
+	job, err := ce.Bridge.DB.GetBootstrapJob(ce.Ctx, login.ID, key)
+	if err == nil && job == nil && portal == nil && !ce.Bridge.Config.SplitPortals {
+		key.Receiver = ""
+		job, err = ce.Bridge.DB.GetBootstrapJob(ce.Ctx, login.ID, key)
+	}
+	if err != nil {
+		ce.Reply("Failed to check import: %v", err)
+		return
+	}
+	portalID := format.SafeMarkdownCode(key.ID)
+	if job == nil {
+		var assigned bool
+		if portal != nil && portal.MXID != "" {
+			userPortal, lookupErr := ce.Bridge.DB.UserPortal.Get(ce.Ctx, login.UserLogin, portal.PortalKey)
+			if lookupErr != nil {
+				ce.Reply("Failed to check portal access: %v", lookupErr)
+				return
+			}
+			assigned = userPortal != nil
+		}
+		if assigned {
+			ce.Reply("Portal %s: unknown. This room predates tracked import.", portalID)
+		} else {
+			ce.Reply("Portal %s: not selected.", portalID)
+		}
+	} else if job.Status == "ready" {
+		ce.Reply("Portal %s: ready. Source-reported history window imported; older unavailable history may still exist.", portalID)
+	} else if job.Status == "reconcile" {
+		ce.Reply("Portal %s: reconcile. Operator review required; automatic room creation and history insertion remain blocked.", portalID)
+	} else {
+		ce.Reply("Portal %s: %s. Source history complete: %t. Room created: %t.", portalID, format.SafeMarkdownCode(job.Status), job.SourceComplete, portal != nil && portal.MXID != "")
+	}
+}
+
 func getClientForStartingChat[T bridgev2.NetworkAPI](ce *Event, thing string) (login *bridgev2.UserLogin, api T, remainingArgs []string) {
 	if len(ce.Args) > 1 {
 		remainingArgs = ce.Args[1:]
