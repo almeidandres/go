@@ -410,7 +410,7 @@ func (portal *Portal) ImportBootstrapHistory(ctx context.Context, source *UserLo
 		if err := portal.sendBatch(ctx, source, messages, true, false, false, false); err != nil {
 			return fmt.Errorf("send bootstrap history batch: %w", err)
 		}
-		for _, message := range messages {
+		for index, message := range messages {
 			for _, part := range message.Parts {
 				stored, err := portal.Bridge.DB.Message.GetPartByID(ctx, portal.Receiver, message.ID, part.ID)
 				if err != nil {
@@ -442,10 +442,13 @@ func (portal *Portal) ImportBootstrapHistory(ctx context.Context, source *UserLo
 					return fmt.Errorf("imported reaction on %s has no mapping", message.ID)
 				}
 			}
-		}
-		for _, item := range items {
-			if err := portal.Bridge.DB.MarkBootstrapDelivered(ctx, source.ID, portal.PortalKey, item.StableID); err != nil {
-				return fmt.Errorf("confirm bootstrap item %s: %w", item.StableID, err)
+			if message.AfterBootstrapImport != nil {
+				if err := message.AfterBootstrapImport(ctx); err != nil {
+					return fmt.Errorf("complete bootstrap item %s: %w", items[index].StableID, err)
+				}
+			}
+			if err := portal.Bridge.DB.MarkBootstrapDelivered(ctx, source.ID, portal.PortalKey, items[index].StableID); err != nil {
+				return fmt.Errorf("confirm bootstrap item %s: %w", items[index].StableID, err)
 			}
 		}
 	}

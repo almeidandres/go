@@ -522,6 +522,8 @@ type BackfillMessage struct {
 	Timestamp   time.Time
 	StreamOrder int64
 	Reactions   []*BackfillReaction
+	// AfterBootstrapImport runs after the message mapping exists, before its durable delivery checkpoint.
+	AfterBootstrapImport func(context.Context) error
 
 	ShouldBackfillThread bool
 	LastThreadMessage    networkid.MessageID
