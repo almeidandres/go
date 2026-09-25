@@ -291,7 +291,7 @@ func (br *Bridge) QueueRemoteEvent(login *UserLogin, evt RemoteEvent) EventHandl
 		}
 		published := job != nil && job.PublishedCached && portal.MXID != "" &&
 			(job.Status == "incomplete" || job.Status == "reconcile")
-		if (job == nil && portal.MXID == "") || (job != nil && job.Status != "ready" && !published) {
+		if job != nil && job.Status != "ready" && !published {
 			if evt.GetType() == RemoteEventChatResync || evt.GetType() == RemoteEventTyping {
 				return EventHandlingResultIgnored
 			}

@@ -5362,41 +5362,40 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 			if err != nil {
 				return err
 			}
-			if bootstrap == nil {
-				return ErrBootstrapNotSelected
-			}
-			if bootstrap.Status == "reconcile" {
-				return ErrBootstrapNeedsReconciliation
-			}
-			if bootstrap.Status == "importing" {
-				if err := portal.Bridge.DB.SetBootstrapStatus(ctx, source.ID, portal.PortalKey, "reconcile", database.BootstrapRoomCreationInterrupted); err != nil {
-					return err
+			if bootstrap != nil {
+				if bootstrap.Status == "reconcile" {
+					return ErrBootstrapNeedsReconciliation
 				}
-				return ErrBootstrapNeedsReconciliation
-			}
-			defer func() {
-				if !finishStarted && retErr != nil && !errors.Is(retErr, ErrBootstrapPending) && !errors.Is(retErr, ErrBootstrapNeedsReconciliation) {
-					statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-					defer cancel()
-					if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "incomplete", retErr.Error()); statusErr != nil {
-						log.Err(statusErr).Msg("Failed to record incomplete portal import")
+				if bootstrap.Status == "importing" {
+					if err := portal.Bridge.DB.SetBootstrapStatus(ctx, source.ID, portal.PortalKey, "reconcile", database.BootstrapRoomCreationInterrupted); err != nil {
+						return err
+					}
+					return ErrBootstrapNeedsReconciliation
+				}
+				defer func() {
+					if !finishStarted && retErr != nil && !errors.Is(retErr, ErrBootstrapPending) && !errors.Is(retErr, ErrBootstrapNeedsReconciliation) {
+						statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+						defer cancel()
+						if statusErr := portal.Bridge.DB.SetBootstrapStatus(statusCtx, source.ID, portal.PortalKey, "incomplete", retErr.Error()); statusErr != nil {
+							log.Err(statusErr).Msg("Failed to record incomplete portal import")
+						}
+					}
+				}()
+				if !bootstrap.SourceComplete && !bootstrap.PublishRequested {
+					if err = history.StageBootstrapHistory(cancellableCtx, portal); err != nil {
+						return fmt.Errorf("stage selected chat history: %w", err)
+					}
+					bootstrap, err = portal.Bridge.DB.GetBootstrapJob(cancellableCtx, source.ID, portal.PortalKey)
+					if err != nil {
+						return err
+					}
+					if bootstrap == nil || (!bootstrap.SourceComplete && !bootstrap.PublishRequested) {
+						return ErrBootstrapPending
 					}
 				}
-			}()
-			if !bootstrap.SourceComplete && !bootstrap.PublishRequested {
-				if err = history.StageBootstrapHistory(cancellableCtx, portal); err != nil {
-					return fmt.Errorf("stage selected chat history: %w", err)
+				if err = portal.Bridge.DB.SetBootstrapStatus(cancellableCtx, source.ID, portal.PortalKey, "importing", ""); err != nil {
+					return fmt.Errorf("start selected chat import: %w", err)
 				}
-				bootstrap, err = portal.Bridge.DB.GetBootstrapJob(cancellableCtx, source.ID, portal.PortalKey)
-				if err != nil {
-					return err
-				}
-				if bootstrap == nil || (!bootstrap.SourceComplete && !bootstrap.PublishRequested) {
-					return ErrBootstrapPending
-				}
-			}
-			if err = portal.Bridge.DB.SetBootstrapStatus(cancellableCtx, source.ID, portal.PortalKey, "importing", ""); err != nil {
-				return fmt.Errorf("start selected chat import: %w", err)
 			}
 		}
 	}
